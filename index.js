@@ -102,6 +102,18 @@ io.on('connection', (socket) => {
     io.to(session.host).emit('interview_ended_host');
   });
 
+  // host can request to end current interview without providing code (fallback)
+  socket.on('end_interview_now', () => {
+    // find session where this socket is host
+    const code = Object.keys(sessions).find((c) => sessions[c].host === socket.id);
+    if (!code) return;
+    const session = sessions[code];
+    const candidate = session.activeCandidate;
+    session.activeCandidate = null;
+    if (candidate) io.to(candidate).emit('interview_ended');
+    io.to(session.host).emit('interview_ended_host');
+  });
+
   // WebRTC signaling forwarding
   socket.on('webrtc_offer', ({ to, sdp }) => {
     // forward to recipient

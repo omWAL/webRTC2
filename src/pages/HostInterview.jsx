@@ -30,6 +30,40 @@ export default function HostInterview() {
       });
     }
 
+    // screen sharing helper for host
+    const hostScreenRef = { sender: null, stream: null };
+
+    // helper to toggle host screen (attach to window so UI button can call it)
+    socket._hostShare = async function toggleHostScreen() {
+      try {
+        if (!hostScreenRef.stream) {
+          const s = await navigator.mediaDevices.getDisplayMedia({ video: true });
+          hostScreenRef.stream = s;
+          const track = s.getVideoTracks()[0];
+          const sender = peer.addTrack(track, s);
+          hostScreenRef.sender = sender;
+          console.log('Host added screen track', sender);
+
+          track.onended = () => {
+            try {
+              if (hostScreenRef.sender) peer.removeTrack(hostScreenRef.sender);
+            } catch (e) {}
+            hostScreenRef.sender = null;
+            hostScreenRef.stream = null;
+          };
+        } else {
+          // stop screen
+          hostScreenRef.stream.getTracks().forEach((t) => t.stop());
+          if (hostScreenRef.sender) peer.removeTrack(hostScreenRef.sender);
+          hostScreenRef.sender = null;
+          hostScreenRef.stream = null;
+        }
+        // trigger negotiation by adding/removing track
+      } catch (err) {
+        console.error('Host screen share failed', err);
+      }
+    };
+
     startLocal().then(() => {
       console.log('Host local started, notifying candidate', candidate);
       socket.emit('host_ready', { to: candidate });
@@ -37,6 +71,28 @@ export default function HostInterview() {
 
     // Keep track of remote streams
     const remoteStreams = new Map();
+
+    // negotiation handler (when host adds tracks like screen)
+    peer.onnegotiationneeded = async () => {
+      try {
+        console.log('Host negotiationneeded - creating offer');
+        const offer = await peer.createOffer();
+        await peer.setLocalDescription(offer);
+        socket.emit('webrtc_offer', { to: candidate, sdp: offer });
+      } catch (err) {
+        console.error('Host negotiation failed', err);
+      }
+    };
+
+    // handle answers to host-initiated offers
+    socket.on('webrtc_answer', async ({ from, sdp }) => {
+      console.log('Host received answer from', from);
+      try {
+        await peer.setRemoteDescription(new RTCSessionDescription(sdp));
+      } catch (err) {
+        console.error('Host failed to set remote description', err);
+      }
+    });
 
     peer.ontrack = (ev) => {
       console.log('Host got ontrack', ev);
@@ -97,6 +153,9 @@ export default function HostInterview() {
 
     socket.on('interview_ended_host', () => {
       // cleanup
+      try {
+        if (hostScreenRef && hostScreenRef.stream) hostScreenRef.stream.getTracks().forEach((t) => t.stop());
+      } catch (e) {}
       if (localStream) localStream.getTracks().forEach((t) => t.stop());
       peer.close();
       sessionStorage.removeItem('activeCandidate');
@@ -106,14 +165,27 @@ export default function HostInterview() {
     return () => {
       socket.off('webrtc_offer');
       socket.off('webrtc_ice');
+      socket.off('webrtc_answer');
       socket.off('interview_ended_host');
+      try {
+        if (hostScreenRef && hostScreenRef.stream) hostScreenRef.stream.getTracks().forEach((t) => t.stop());
+      } catch (e) {}
       if (peer && peer.connectionState !== 'closed') peer.close();
     };
   }, []);
 
   function endInterview() {
     const code = sessionStorage.getItem('hostSession');
-    socket.emit('end_interview', { code });
+    console.log('Host clicked End Interview, code=', code);
+    if (code) {
+      socket.emit('end_interview', { code }, (res) => {
+        // no callback on server currently, but keep for future
+        console.log('end_interview ack', res);
+      });
+    } else {
+      // fallback
+      socket.emit('end_interview_now');
+    }
   }
 
   return (
@@ -136,6 +208,7 @@ export default function HostInterview() {
 
       <div style={{ marginTop: 10 }}>
         <button onClick={endInterview}>End Interview</button>
+        <button style={{ marginLeft: 10 }} onClick={() => { if (socket._hostShare) socket._hostShare(); else console.warn('host share not available'); }}>Share Screen</button>
       </div>
     </div>
   );

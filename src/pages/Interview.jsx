@@ -81,6 +81,20 @@ export default function Interview() {
       }
     });
 
+    // receive offer (host may initiate renegotiation for screen or other tracks)
+    socket.on('webrtc_offer', async ({ from, sdp }) => {
+      console.log('Candidate received offer from', from);
+      try {
+        await peer.setRemoteDescription(new RTCSessionDescription(sdp));
+        const answer = await peer.createAnswer();
+        await peer.setLocalDescription(answer);
+        socket.emit('webrtc_answer', { to: from, sdp: answer });
+        console.log('Candidate sent answer to', from);
+      } catch (err) {
+        console.error('Candidate failed to handle offer', err);
+      }
+    });
+
     // receive ICE from host
     socket.on('webrtc_ice', async ({ candidate }) => {
       console.log('Candidate received ICE', candidate);
@@ -91,7 +105,19 @@ export default function Interview() {
       }
     });
 
-    // create offer to host
+    // negotiation handler so adding/removing tracks triggers re-negotiation
+    peer.onnegotiationneeded = async () => {
+      try {
+        console.log('Candidate negotiationneeded - creating offer');
+        const offer = await peer.createOffer();
+        await peer.setLocalDescription(offer);
+        socket.emit('webrtc_offer', { to: hostId, sdp: offer });
+      } catch (err) {
+        console.error('Candidate negotiation failed', err);
+      }
+    };
+
+    // create offer to host (initial)
     async function createOffer() {
       console.log('Candidate creating offer to host', hostId);
       const offer = await peer.createOffer();
@@ -122,6 +148,7 @@ export default function Interview() {
     return () => {
       clearTimeout(fallbackOffer);
       socket.off('webrtc_answer');
+      socket.off('webrtc_offer');
       socket.off('webrtc_ice');
       socket.off('interview_ended');
       socket.off('host_ready');
