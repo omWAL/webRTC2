@@ -2,6 +2,16 @@ import React, { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import socket from '../socket';
 import DebugPanel from '../components/DebugPanel';
+import {
+  startRecording,
+  stopRecording,
+  pauseRecording,
+  resumeRecording,
+  startTimer,
+  stopTimer,
+  downloadRecording,
+  uploadRecordingToServer
+} from '../utils/recordingUtils';
 
 export default function Interview() {
   const localVideoRef = useRef();
@@ -15,6 +25,12 @@ export default function Interview() {
   const [screenStream, setScreenStream] = useState(null);
   const [hostSharing, setHostSharing] = useState(false);
   const navigate = useNavigate();
+
+  // Recording state
+  const [isRecording, setIsRecording] = useState(false);
+  const [isRecordingPaused, setIsRecordingPaused] = useState(false);
+  const [recordingTime, setRecordingTime] = useState('00:00');
+  const recordingCanvasRef = useRef(null);
 
   function stopLocalAndCleanup() {
     try { if (screenStream) screenStream.getTracks().forEach((t) => t.stop()); } catch (e) {}
@@ -50,77 +66,32 @@ export default function Interview() {
       });
     }
 
-    // remote stream handling: if host sends one or multiple streams, attach appropriately
-    const remoteStreams = new Map();
-
-    // buffered ontrack handling to avoid misclassification when tracks arrive before settings are available
-    const incomingStreams = new Map();
-    let resolveTimer = null;
-    function scheduleResolveIncoming() {
-      if (resolveTimer) return;
-      resolveTimer = setTimeout(() => {
-        resolveTimer = null;
-        // classify and attach
-        for (const [key, s] of incomingStreams.entries()) {
-          const stream = s.stream;
-          const videoTrack = stream.getVideoTracks()[0];
-          const settings = videoTrack && videoTrack.getSettings ? videoTrack.getSettings() : {};
-
-          // detect screen via explicit signal first (helps when label/settings aren't available),
-          // then fall back to displaySurface, label heuristics, then resolution
-          let isScreen = false;
-          if (expectScreenRef.current) {
-            isScreen = true;
-            expectScreenRef.current = false;
-            pushLog('Using signal to classify as screen');
-          } else if (settings.displaySurface && settings.displaySurface !== 'none') {
-            isScreen = true;
-          } else {
-            const label = (videoTrack && videoTrack.label) ? videoTrack.label.toLowerCase() : '';
-            if (/screen|display|window|monitor|sharing/i.test(label)) isScreen = true;
-            else if (settings.width && settings.height) {
-              if (settings.width >= 1280 || settings.height >= 720) isScreen = true;
-            }
-          }
-
-          const id = stream.id || (videoTrack && videoTrack.id) || key;
-          pushLog('Resolving incoming stream ' + id + ' isScreen=' + isScreen);
-
-          if (isScreen) {
-            screenVideoRef.current.srcObject = stream;
-            pushLog('Attached host screen stream to screenVideoRef ' + id);
-            remoteStreams.set(id, stream);
-            setHostSharing(true);
-            try { if (videoTrack) videoTrack.onended = () => setHostSharing(false); } catch (e) {}
-          } else {
-            // camera
-            if (!hostVideoRef.current.srcObject) {
-              hostVideoRef.current.srcObject = stream;
-              pushLog('Attached host camera stream ' + id);
-            } else {
-              // prefer keeping existing camera; if none, set
-              hostVideoRef.current.srcObject = stream;
-              pushLog('Replaced host camera stream ' + id);
-            }
-            remoteStreams.set(id, stream);
-            try { if (videoTrack) videoTrack.onended = () => { hostVideoRef.current.srcObject = null; pushLog('Host camera track ended'); }; } catch (e) {}
-          }
-
-          incomingStreams.delete(key);
-        }
-      }, 200);
-    }
-
+    // Simple ontrack handler - attach immediately
     peer.ontrack = (ev) => {
-      console.log('Candidate got ontrack (buffered)', ev);
+      console.log('Candidate got ontrack event', ev.track.kind, ev.track.id);
       let stream = ev.streams && ev.streams[0];
       if (!stream) {
         stream = new MediaStream();
         if (ev.track) stream.addTrack(ev.track);
       }
-      const key = Date.now() + Math.random();
-      incomingStreams.set(key, { stream });
-      scheduleResolveIncoming();
+      
+      const audioCount = stream.getAudioTracks().length;
+      const videoCount = stream.getVideoTracks().length;
+      pushLog('Candidate ontrack: audio=' + audioCount + ' video=' + videoCount + ' trackKind=' + ev.track.kind);
+      
+      // Simple heuristic: if no audio tracks, treat as screen share
+      const isScreen = audioCount === 0 && videoCount > 0;
+      
+      if (isScreen) {
+        pushLog('Candidate: attaching to host screen element');
+        if (screenVideoRef.current) screenVideoRef.current.srcObject = stream;
+        setHostSharing(true);
+      } else {
+        pushLog('Candidate: attaching to host camera element');
+        if (hostVideoRef.current) hostVideoRef.current.srcObject = stream;
+      }
+      
+      remoteStreams.set(stream.id || ev.track.id, { type: isScreen ? 'screen' : 'camera', stream });
     };
 
     peer.oniceconnectionstatechange = () => {
@@ -239,19 +210,6 @@ export default function Interview() {
       createOffer();
     });
 
-    // Listen for explicit screen-share signals from host to help classification
-    const expectScreenRef = { current: false };
-    socket.on('screen_share_started', ({ from }) => {
-      pushLog('Candidate received screen_share_started signal from ' + from);
-      expectScreenRef.current = true;
-      setHostSharing(true);
-    });
-    socket.on('screen_share_stopped', ({ from }) => {
-      pushLog('Candidate received screen_share_stopped signal from ' + from);
-      expectScreenRef.current = false;
-      setHostSharing(false);
-    });
-
     // Fallback in case 'host_ready' is missed
     const fallbackOffer = setTimeout(() => {
       console.warn('Fallback: creating offer after timeout');
@@ -266,14 +224,11 @@ export default function Interview() {
 
     return () => {
       clearTimeout(fallbackOffer);
-      try { if (resolveTimer) clearTimeout(resolveTimer); } catch (e) {}
       socket.off('webrtc_answer');
       socket.off('webrtc_offer');
       socket.off('webrtc_ice');
       socket.off('interview_ended');
       socket.off('host_ready');
-      socket.off('screen_share_started');
-      socket.off('screen_share_stopped');
       try { if (pcRef.current) { pcRef.current.close(); pcRef.current = null; } } catch (e) {}
     };
   }, []);
@@ -367,6 +322,109 @@ export default function Interview() {
     setScreenStream(null);
   }
 
+  async function handleToggleRecording() {
+    if (!isRecording) {
+      try {
+        setIsRecording(true);
+        setIsRecordingPaused(false);
+        pushLog('Starting video recording...');
+        await startRecording(recordingCanvasRef.current, [localStreamRef.current?.getAudioTracks()[0]].filter(Boolean));
+        startTimer(setRecordingTime);
+      } catch (err) {
+        pushLog('Failed to start recording: ' + err.message);
+        setIsRecording(false);
+      }
+    } else {
+      try {
+        pushLog('Stopping video recording...');
+        stopTimer();
+        const { ok, blob } = await stopRecording();
+        if (ok) {
+          downloadRecording(blob, `candidate-interview-${Date.now()}.webm`);
+          pushLog('Recording downloaded successfully');
+        }
+        setIsRecording(false);
+        setIsRecordingPaused(false);
+        setRecordingTime('00:00');
+      } catch (err) {
+        pushLog('Failed to stop recording: ' + err.message);
+      }
+    }
+  }
+
+  function handleTogglePauseRecording() {
+    if (isRecordingPaused) {
+      const { ok } = resumeRecording();
+      if (ok) {
+        setIsRecordingPaused(false);
+        startTimer(setRecordingTime);
+        pushLog('Recording resumed');
+      }
+    } else {
+      const { ok } = pauseRecording();
+      if (ok) {
+        setIsRecordingPaused(true);
+        stopTimer();
+        pushLog('Recording paused');
+      }
+    }
+  }
+
+  async function handleUploadRecording() {
+    try {
+      if (isRecording) {
+        pushLog('Please stop recording before uploading');
+        return;
+      }
+      pushLog('Uploading recording to server...');
+    } catch (err) {
+      pushLog('Upload failed: ' + err.message);
+    }
+  }
+
+  useEffect(() => {
+    if (recordingCanvasRef.current) {
+      const canvas = recordingCanvasRef.current;
+      // Larger canvas to match actual visual layout
+      // Layout: 3 videos (320x240 each) side by side with 20px gap = 960 + 40 = 1000px wide, 240px high
+      canvas.width = 1000;
+      canvas.height = 280;
+      const ctx = canvas.getContext('2d');
+      
+      const drawFrame = () => {
+        // Clear canvas
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        
+        // Draw local video at (0, 0)
+        if (localVideoRef.current && localVideoRef.current.readyState === localVideoRef.current.HAVE_ENOUGH_DATA) {
+          ctx.drawImage(localVideoRef.current, 0, 0, 320, 240);
+        }
+        
+        // Draw host camera at (340, 0) [320 + 20 gap]
+        if (hostVideoRef.current && hostVideoRef.current.readyState === hostVideoRef.current.HAVE_ENOUGH_DATA) {
+          ctx.drawImage(hostVideoRef.current, 340, 0, 320, 240);
+        }
+        
+        // Draw host screen at (680, 0) [320 + 20 + 320 + 20]
+        if (screenVideoRef.current && screenVideoRef.current.readyState === screenVideoRef.current.HAVE_ENOUGH_DATA) {
+          ctx.drawImage(screenVideoRef.current, 680, 0, 320, 240);
+        }
+      };
+      
+      const interval = setInterval(drawFrame, 33);
+      return () => clearInterval(interval);
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (isRecording) {
+        stopTimer();
+      }
+    };
+  }, [isRecording]);
+
   return (
     <div style={{ padding: 20 }}>
       <h2>Interview (Candidate)</h2>
@@ -386,8 +444,77 @@ export default function Interview() {
       </div>
 
       <div style={{ marginTop: 10 }}>
-        <button onClick={toggleScreen} style={{ backgroundColor: screenSharing ? 'green' : undefined }}>{screenSharing ? 'Stop Screen Share' : 'Share Screen'}</button>
+        <button
+          style={{
+            backgroundColor: '#f44336',
+            color: 'white',
+            padding: '10px 15px',
+            border: 'none',
+            borderRadius: '5px',
+            cursor: 'pointer',
+            fontWeight: 'bold'
+          }}
+          onClick={() => {
+            stopLocalAndCleanup();
+            socket.emit('end_interview_now');
+            navigate('/join');
+          }}
+        >
+          End Interview
+        </button>
+        <button onClick={toggleScreen} style={{ marginLeft: 10, backgroundColor: screenSharing ? 'green' : undefined }}>{screenSharing ? 'Stop Screen Share' : 'Share Screen'}</button>
+        <button
+          style={{
+            marginLeft: 10,
+            backgroundColor: isRecording ? 'red' : '#ccc',
+            color: isRecording ? 'white' : 'black',
+            padding: '10px 15px',
+            border: 'none',
+            borderRadius: '5px',
+            cursor: 'pointer',
+            fontWeight: 'bold'
+          }}
+          onClick={handleToggleRecording}
+        >
+          {isRecording ? `Stop Recording (${recordingTime})` : 'Record'}
+        </button>
+        {isRecording && (
+          <button
+            style={{
+              marginLeft: 10,
+              backgroundColor: isRecordingPaused ? 'orange' : 'blue',
+              color: 'white',
+              padding: '10px 15px',
+              border: 'none',
+              borderRadius: '5px',
+              cursor: 'pointer',
+              fontWeight: 'bold'
+            }}
+            onClick={handleTogglePauseRecording}
+          >
+            {isRecordingPaused ? 'Resume Recording' : 'Pause Recording'}
+          </button>
+        )}
+        <button
+          style={{
+            marginLeft: 10,
+            backgroundColor: '#4CAF50',
+            color: 'white',
+            padding: '10px 15px',
+            border: 'none',
+            borderRadius: '5px',
+            cursor: 'pointer',
+            fontWeight: 'bold'
+          }}
+          onClick={handleUploadRecording}
+        >
+          Upload to Server
+        </button>
       </div>
+      <canvas
+        ref={recordingCanvasRef}
+        style={{ display: 'none', width: 1000, height: 280 }}
+      />
 
       <DebugPanel logs={logs} />
     </div>

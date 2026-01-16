@@ -1,6 +1,9 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const fs = require('fs');
+const path = require('path');
+const multer = require('multer');
 
 const app = express();
 const server = http.createServer(app);
@@ -8,6 +11,36 @@ const io = new Server(server, {
   cors: {
     origin: '*',
     methods: ['GET', 'POST']
+  }
+});
+
+// Create recordings directory if it doesn't exist
+const recordingsDir = path.join(__dirname, 'recordings');
+if (!fs.existsSync(recordingsDir)) {
+  fs.mkdirSync(recordingsDir, { recursive: true });
+}
+
+// Setup multer for file uploads
+const upload = multer({ dest: recordingsDir });
+
+// Middleware
+app.use(express.json());
+app.use(express.static('dist'));
+
+// API endpoint for recording uploads
+app.post('/api/recordings', upload.single('recording'), (req, res) => {
+  try {
+    const fileName = req.body.fileName || `recording-${Date.now()}.webm`;
+    const oldPath = req.file.path;
+    const newPath = path.join(recordingsDir, fileName);
+    
+    fs.renameSync(oldPath, newPath);
+    console.log('Recording saved:', newPath);
+    
+    res.json({ ok: true, message: 'Recording uploaded', fileName, path: newPath });
+  } catch (err) {
+    console.error('Recording upload failed:', err);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 

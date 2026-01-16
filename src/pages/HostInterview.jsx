@@ -2,6 +2,16 @@ import React, { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import socket from '../socket';
 import DebugPanel from '../components/DebugPanel';
+import {
+  startRecording,
+  stopRecording,
+  pauseRecording,
+  resumeRecording,
+  startTimer,
+  stopTimer,
+  downloadRecording,
+  uploadRecordingToServer
+} from '../utils/recordingUtils';
 
 export default function HostInterview() {
   const localVideoRef = useRef();
@@ -14,6 +24,12 @@ export default function HostInterview() {
   const [hostSharing, setHostSharing] = useState(false);
   const hostScreenRef = useRef({ sender: null, stream: null });
   const navigate = useNavigate();
+
+  // Recording state
+  const [isRecording, setIsRecording] = useState(false);
+  const [isRecordingPaused, setIsRecordingPaused] = useState(false);
+  const [recordingTime, setRecordingTime] = useState('00:00');
+  const recordingCanvasRef = useRef(null);
 
   function stopLocalAndCleanup() {
     try {
@@ -109,6 +125,109 @@ export default function HostInterview() {
     }
   }
 
+  async function handleToggleRecording() {
+    if (!isRecording) {
+      try {
+        setIsRecording(true);
+        setIsRecordingPaused(false);
+        pushLog('Starting video recording...');
+        await startRecording(recordingCanvasRef.current, [localStreamRef.current?.getAudioTracks()[0]].filter(Boolean));
+        startTimer(setRecordingTime);
+      } catch (err) {
+        pushLog('Failed to start recording: ' + err.message);
+        setIsRecording(false);
+      }
+    } else {
+      try {
+        pushLog('Stopping video recording...');
+        stopTimer();
+        const { ok, blob } = await stopRecording();
+        if (ok) {
+          downloadRecording(blob, `host-interview-${Date.now()}.webm`);
+          pushLog('Recording downloaded successfully');
+        }
+        setIsRecording(false);
+        setIsRecordingPaused(false);
+        setRecordingTime('00:00');
+      } catch (err) {
+        pushLog('Failed to stop recording: ' + err.message);
+      }
+    }
+  }
+
+  function handleTogglePauseRecording() {
+    if (isRecordingPaused) {
+      const { ok } = resumeRecording();
+      if (ok) {
+        setIsRecordingPaused(false);
+        startTimer(setRecordingTime);
+        pushLog('Recording resumed');
+      }
+    } else {
+      const { ok } = pauseRecording();
+      if (ok) {
+        setIsRecordingPaused(true);
+        stopTimer();
+        pushLog('Recording paused');
+      }
+    }
+  }
+
+  async function handleUploadRecording() {
+    try {
+      if (isRecording) {
+        pushLog('Please stop recording before uploading');
+        return;
+      }
+      pushLog('Uploading recording to server...');
+    } catch (err) {
+      pushLog('Upload failed: ' + err.message);
+    }
+  }
+
+  useEffect(() => {
+    if (recordingCanvasRef.current) {
+      const canvas = recordingCanvasRef.current;
+      // Larger canvas to match actual visual layout
+      // Layout: 3 videos (320x240 each) side by side with 20px gap = 960 + 40 = 1000px wide, 240px high
+      canvas.width = 1000;
+      canvas.height = 280;
+      const ctx = canvas.getContext('2d');
+      
+      const drawFrame = () => {
+        // Clear canvas
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        
+        // Draw local video at (0, 0)
+        if (localVideoRef.current && localVideoRef.current.readyState === localVideoRef.current.HAVE_ENOUGH_DATA) {
+          ctx.drawImage(localVideoRef.current, 0, 0, 320, 240);
+        }
+        
+        // Draw candidate camera at (340, 0) [320 + 20 gap]
+        if (candidateVideoRef.current && candidateVideoRef.current.readyState === candidateVideoRef.current.HAVE_ENOUGH_DATA) {
+          ctx.drawImage(candidateVideoRef.current, 340, 0, 320, 240);
+        }
+        
+        // Draw candidate screen at (680, 0) [320 + 20 + 320 + 20]
+        if (screenVideoRef.current && screenVideoRef.current.readyState === screenVideoRef.current.HAVE_ENOUGH_DATA) {
+          ctx.drawImage(screenVideoRef.current, 680, 0, 320, 240);
+        }
+      };
+      
+      const interval = setInterval(drawFrame, 33);
+      return () => clearInterval(interval);
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (isRecording) {
+        stopTimer();
+      }
+    };
+  }, [isRecording]);
+
   useEffect(() => {
     const session = sessionStorage.getItem('hostSession');
     const candidate = sessionStorage.getItem('activeCandidate');
@@ -193,85 +312,32 @@ export default function HostInterview() {
       }
     });
 
-    // buffered ontrack handling for host to avoid misclassification
-    const incomingStreamsHost = new Map();
-    let resolveTimerHost = null;
-    const expectScreenHostRef = { current: false };
-
-    // listen for candidate screen signals
-    socket.on('screen_share_started', ({ from }) => {
-      pushLog('Host received screen_share_started signal from ' + from);
-      expectScreenHostRef.current = true;
-    });
-    socket.on('screen_share_stopped', ({ from }) => {
-      pushLog('Host received screen_share_stopped signal from ' + from);
-      expectScreenHostRef.current = false;
-    });
-
-    function scheduleResolveIncomingHost() {
-      if (resolveTimerHost) return;
-      resolveTimerHost = setTimeout(() => {
-        resolveTimerHost = null;
-        for (const [key, s] of incomingStreamsHost.entries()) {
-          const stream = s.stream;
-          const videoTrack = stream.getVideoTracks()[0];
-          const settings = videoTrack && videoTrack.getSettings ? videoTrack.getSettings() : {};
-
-          // detect screen via explicit signal first, then displaySurface, label heuristics,
-          // then resolution, and as a practical heuristic treat video-without-audio as screen
-          const audioCount = stream.getAudioTracks().length;
-          const videoCount = stream.getVideoTracks().length;
-          pushLog('Host incoming stream tracks audio=' + audioCount + ' video=' + videoCount + ' settings=' + JSON.stringify({ width: settings.width, height: settings.height, displaySurface: settings.displaySurface }));
-
-          let isScreen = false;
-          if (expectScreenHostRef.current) {
-            isScreen = true;
-            expectScreenHostRef.current = false;
-            pushLog('Host using signal to classify as screen');
-          } else if (settings.displaySurface && settings.displaySurface !== 'none') {
-            isScreen = true;
-          } else if (videoCount > 0 && audioCount === 0) {
-            // common case: screen tracks often arrive without an audio track
-            isScreen = true;
-            pushLog('Host classifying as screen because video present but no audio');
-          } else {
-            const label = (videoTrack && videoTrack.label) ? videoTrack.label.toLowerCase() : '';
-            if (/screen|display|window|monitor|sharing/i.test(label)) isScreen = true;
-            else if (settings.width && settings.height) {
-              if (settings.width >= 1280 || settings.height >= 720) isScreen = true;
-            }
-          }
-
-          const id = stream.id || (videoTrack && videoTrack.id) || key;
-          pushLog('Host resolving incoming stream ' + id + ' isScreen=' + isScreen);
-
-          // if it's screen, attach to screenVideoRef
-          if (isScreen) {
-            remoteStreams.set(id, { type: 'screen', stream });
-            if (screenVideoRef.current) screenVideoRef.current.srcObject = stream;
-            pushLog('Attached candidate screen stream ' + id);
-            try { if (videoTrack) videoTrack.onended = () => setHostSharing(false); } catch (e) {}
-          } else {
-            remoteStreams.set(id, { type: 'camera', stream });
-            if (candidateVideoRef.current) candidateVideoRef.current.srcObject = stream;
-            pushLog('Attached candidate camera stream ' + id);
-          }
-
-          incomingStreamsHost.delete(key);
-        }
-      }, 200);
-    }
-
+    // Simple ontrack handler - attach immediately
     peer.ontrack = (ev) => {
-      console.log('Host got ontrack (buffered)', ev);
+      console.log('Host got ontrack event', ev.track.kind, ev.track.id);
       let stream = ev.streams && ev.streams[0];
       if (!stream) {
         stream = new MediaStream();
         if (ev.track) stream.addTrack(ev.track);
       }
-      const key = Date.now() + Math.random();
-      incomingStreamsHost.set(key, { stream });
-      scheduleResolveIncomingHost();
+      
+      const audioCount = stream.getAudioTracks().length;
+      const videoCount = stream.getVideoTracks().length;
+      pushLog('Host ontrack: audio=' + audioCount + ' video=' + videoCount + ' trackKind=' + ev.track.kind);
+      
+      // Simple heuristic: if no audio tracks, treat as screen share
+      const isScreen = audioCount === 0 && videoCount > 0;
+      
+      if (isScreen) {
+        pushLog('Host: attaching to screen share element');
+        if (screenVideoRef.current) screenVideoRef.current.srcObject = stream;
+        setHostSharing(true);
+      } else {
+        pushLog('Host: attaching to candidate camera element');
+        if (candidateVideoRef.current) candidateVideoRef.current.srcObject = stream;
+      }
+      
+      remoteStreams.set(stream.id || ev.track.id, { type: isScreen ? 'screen' : 'camera', stream });
     };
 
     peer.onicecandidate = (e) => {
@@ -313,13 +379,10 @@ export default function HostInterview() {
     });
 
     return () => {
-      try { if (resolveTimerHost) clearTimeout(resolveTimerHost); } catch (e) {}
       socket.off('webrtc_offer');
       socket.off('webrtc_ice');
       socket.off('webrtc_answer');
       socket.off('interview_ended_host');
-      socket.off('screen_share_started');
-      socket.off('screen_share_stopped');
       try {
         if (hostScreenRef && hostScreenRef.current && hostScreenRef.current.stream) hostScreenRef.current.stream.getTracks().forEach((t) => t.stop());
       } catch (e) {}
@@ -372,7 +435,58 @@ export default function HostInterview() {
           const code = sessionStorage.getItem('hostSession');
           if (code) socket.emit('start_next', { code });
         }}>Start Next</button>
+        <button
+          style={{
+            marginLeft: 10,
+            backgroundColor: isRecording ? 'red' : '#ccc',
+            color: isRecording ? 'white' : 'black',
+            padding: '10px 15px',
+            border: 'none',
+            borderRadius: '5px',
+            cursor: 'pointer',
+            fontWeight: 'bold'
+          }}
+          onClick={handleToggleRecording}
+        >
+          {isRecording ? `Stop Recording (${recordingTime})` : 'Record'}
+        </button>
+        {isRecording && (
+          <button
+            style={{
+              marginLeft: 10,
+              backgroundColor: isRecordingPaused ? 'orange' : 'blue',
+              color: 'white',
+              padding: '10px 15px',
+              border: 'none',
+              borderRadius: '5px',
+              cursor: 'pointer',
+              fontWeight: 'bold'
+            }}
+            onClick={handleTogglePauseRecording}
+          >
+            {isRecordingPaused ? 'Resume Recording' : 'Pause Recording'}
+          </button>
+        )}
+        <button
+          style={{
+            marginLeft: 10,
+            backgroundColor: '#4CAF50',
+            color: 'white',
+            padding: '10px 15px',
+            border: 'none',
+            borderRadius: '5px',
+            cursor: 'pointer',
+            fontWeight: 'bold'
+          }}
+          onClick={handleUploadRecording}
+        >
+          Upload to Server
+        </button>
       </div>
+      <canvas
+        ref={recordingCanvasRef}
+        style={{ display: 'none', width: 1000, height: 280 }}
+      />
 
       <DebugPanel logs={logs} />
     </div>
