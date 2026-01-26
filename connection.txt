@@ -3,7 +3,7 @@ PROJECT STRUCTURE AND FILE CONNECTIONS
 This document explains the role of each file in the project and how they are connected to create the WebRTC Interview System.
 
 =========================================
-1. BACKEND (Server-Side)
+1. BACKEND (Server-Side).
 =========================================
 
 [index.js]
